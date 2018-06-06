@@ -11,6 +11,7 @@ import numpy as np
 import collections
 from dataloader import DataLoader
 import sys
+import Helper
 
 def load_data():
     data_loader = DataLoader("data_10k.txt")
@@ -18,13 +19,15 @@ def load_data():
     train_data = np.asarray(train_data)
     test_data = np.asarray(test_data)
     return train_data, test_data, data_loader.vocab_size, \
-            data_loader.sentence_max_len, data_loader.id_to_label, data_loader.label_size
+            data_loader.sentence_max_len, data_loader.id_to_label, \
+            data_loader.word_to_id, data_loader.label_size
 
 # For input data
 def batch_producer(data, batch_size, num_steps):
     data_len = len(data)
     data = tf.convert_to_tensor(data, tf.int32)
     batch_len = int(data_len // batch_size)
+
     i = tf.train.range_input_producer(batch_len, shuffle=False).dequeue()
 
     x = data[i * batch_size : (i+1) * batch_size, 0, : ]
@@ -35,7 +38,7 @@ def batch_producer(data, batch_size, num_steps):
     return x, y
 
 class Config():
-    learning_rate = 2.6
+    learning_rate = 1.0
     num_layers = 1
     hidden_size = 60
     batch_size = 50
@@ -44,8 +47,8 @@ class Config():
     lr_decay = 0.8
     print_iter = 50
     logs_path = "/tmp/tensorflow_logs/gr_final_result/"
-    model_path = "model/birnn_full_results_epoch_10k_60_hidden_size_50_batch_size_lr_2.6/model.ckpt"
-    result_path = "result/birnn_full_results_epoch_10k_60_hidden_size_50_batch_size_lr_2.6.csv"
+    model_path = "model/birnn_full_results_epoch_10k_60_hidden_size_50_batch_size/model.ckpt"
+    result_path = "result/birnn_full_results_epoch_10k_60_hidden_size_50_batch_size.csv"
 
 class Input(object):
     def __init__(self, batch_size, num_steps, data):
@@ -53,6 +56,7 @@ class Input(object):
         self.num_steps = num_steps
         self.batch_len = int(len(data) // batch_size)
         self.input_data, self.targets = batch_producer(data, batch_size, num_steps)
+
 class Model(object):
     def __init__(self, input, is_training, hidden_size, vocab_size, label_size, num_layers, dropout=0.5, init_scale=0.05):
         self.is_training = is_training
@@ -217,6 +221,7 @@ def test_model(model, test_data, id_to_label, num_steps, vocab_size, label_size,
         for batch in range(batch_len):
             true_vals, pred, fw_state, bw_state, acc, sentence_acc = sess.run([model.input_obj.targets, model.predict, model.fw_state, model.bw_state, model.accuracy, model.sentence_accuracy],
                                                             feed_dict={model.init_fw_state: fw_state, model.init_bw_state: bw_state})
+
             pred = np.reshape(pred, [config.batch_size, num_steps])
             predicts.append(pred)
             accuracy += acc
@@ -235,24 +240,69 @@ def test_model(model, test_data, id_to_label, num_steps, vocab_size, label_size,
         coord.request_stop()
         coord.join(threads)
 
+def predict_model(query, word_to_id, id_to_label, config, num_steps, vocabulary, label_size):
+    MAX_LENGTH = num_steps
+    query_words = query.split(" ")
+    length_of_query = len(query_words)
+    batch_size = 1
+    # add padding
+    for i in range(MAX_LENGTH - length_of_query):
+        query_words.append("<pad>")
+    # word -> id
+    query_ids = []
+    for word in query_words:
+        id = word_to_id["<u>"]
+        if Helper.represents_int(word):
+            id = word_to_id["<number>"]
+        else:
+            if word in word_to_id:
+                id = word_to_id[word]
+        query_ids.append(id)
+
+    target = [0] * num_steps
+    query_ids = [[query_ids, target]]
+    pred_input = Input(batch_size, num_steps, query_ids)
+    model = Model(pred_input, False, config.hidden_size, vocabulary, label_size, config.num_layers, dropout=1)
+    # embedding
+    saver = tf.train.Saver()
+    prediction = []
+    with tf.Session() as sess:
+        # start threads
+        coord = tf.train.Coordinator()
+        threads = tf.train.start_queue_runners(coord=coord)
+        fw_state = np.zeros((config.num_layers, 2, batch_size, model.hidden_size))
+        bw_state = np.zeros((config.num_layers, 2, batch_size, model.hidden_size))
+        # restore the trained model
+        saver.restore(sess, config.model_path + "-" + str(config.num_epochs))
+        # get an average accuracy over batch_len
+        prediction = sess.run([model.predict], feed_dict={model.init_fw_state: fw_state, model.init_bw_state: bw_state})
+        # close threads
+        coord.request_stop()
+        coord.join(threads)
+    # because out input has just one sentence
+    prediction = prediction[0][:length_of_query]
+    result = []
+    for i in prediction:
+        if i in id_to_label:
+            result.append(id_to_label[i])
+        else:
+            result.append("<u>")
+    print("Query: {}\n".format(query.split(" ")))
+    print("Label: {}".format(result))
+
 def f1(prediction, target, max_length, label_size):
     # label_size is included padding element
     tp = np.array([0] * label_size) # true positive
     fp = np.array([0] * label_size) # false positive
     fn = np.array([0] * label_size) # false negative
 
-    count_sentence_true = 0
     for i in range(len(target)):
-        result_predict_sentence_cur = True
         for j in range(max_length):
             if target[i, j] == prediction[i, j]:
                 tp[target[i, j]] += 1
             else:
-                result_predict_sentence_cur = False
                 fp[target[i, j]] += 1
                 fn[prediction[i, j]] += 1
-        if result_predict_sentence_cur:
-            count_sentence_true += 1
     UNLABLED = 0
     for i in range(label_size - 1):
         if i != UNLABLED:
@@ -270,14 +320,21 @@ def f1(prediction, target, max_length, label_size):
     return precision[label_size - 1], recall[label_size - 1], f1_score[label_size - 1]
 
 if __name__ == "__main__":
-    train_data, test_data, vocabulary, num_steps, id_to_label, label_size = load_data()
+    train_data, test_data, vocabulary, num_steps, id_to_label, word_to_id, label_size = load_data()
     config = Config()
     if len(sys.argv) < 2:
         train_model(train_data, vocabulary, label_size, num_steps, config)
     else:
-        with open(config.result_path, "a") as f:
-            f.write("Epoch, Acc, Sentence Acc, F1 score\n")
-        test_input = Input(config.batch_size, num_steps, test_data)
-        model = Model(test_input, False, config.hidden_size, vocabulary, label_size, config.num_layers, dropout=1)
-        for i in range(config.num_epochs):
-            test_model(model, test_data, id_to_label, num_steps, vocabulary, label_size, config, i)
+        # For prediction
+        if sys.argv[1] in ["prediction", "predict", "pre"]:
+            query = input("query: > ")
+            predict_model(query, word_to_id, id_to_label, config, num_steps, vocabulary, label_size)
+        # For Testing
+        else:
+            test_input = Input(config.batch_size, num_steps, test_data)
+
+            model = Model(test_input, False, config.hidden_size, vocabulary, label_size, config.num_layers, dropout=1)
+            with open(config.result_path, "a") as f:
+                f.write("Epoch, Acc, Sentence Acc, F1 score\n")
+            for i in range(config.num_epochs):
+                test_model(model, test_data, id_to_label, num_steps, vocabulary, label_size, config, i)
